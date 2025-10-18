@@ -1,0 +1,1513 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, collection, query, where, getDocs, deleteDoc } from 'firebase/firestore';
+// Import Chart components and register elements
+import { Chart as ChartJS, CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend, ArcElement } from 'chart.js';
+import { Bar, Pie } from 'react-chartjs-2';
+
+// Register Chart.js components
+ChartJS.register(
+    CategoryScale,
+    LinearScale,
+    BarElement,
+    Title,
+    Tooltip,
+    Legend,
+    ArcElement
+);
+
+// --- Global Variables provided by the Canvas Environment ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {}; 
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null; 
+const API_KEY = ""; // Placeholder for Gemini API Key
+
+// --- Utility Functions for Firebase/IHT Calculations ---
+
+/** Converts a number to a GBP currency string. */
+const formatCurrency = (amount) => {
+    // Ensure negative amounts are formatted correctly
+    const sign = amount < 0 ? '-' : '';
+    const absoluteAmount = Math.abs(amount);
+    return sign + '£' + (absoluteAmount).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+};
+
+/** Calculates the Taper Relief percentage based on years since the gift was made. */
+const calculateTaperReliefFactor = (giftDate, projectionYears = 0) => {
+    if (!giftDate) return 1.0; // No date, assume full 40% liability
+    const dateOfGift = new Date(giftDate);
+    const futureDate = new Date();
+    futureDate.setFullYear(futureDate.getFullYear() + projectionYears);
+    
+    const years = (futureDate - dateOfGift) / (1000 * 60 * 60 * 24 * 365.25);
+
+    if (years >= 7) return 0.0; // Gift is completely exempt (0% liability)
+    if (years < 3) return 1.0; // Full 40% liability (100% of tax due)
+    if (years < 4) return 0.8; // 20% reduction (80% of tax due)
+    if (years < 5) return 0.6; // 40% reduction (60% of tax due)
+    if (years < 6) return 0.4; // 60% reduction (40% of tax due)
+    if (years < 7) return 0.2; // 80% reduction (20% of tax due)
+
+    return 1.0; // Should not happen
+};
+
+/** Core calculation logic factored out into a function for reusability (for series generation). */
+const calculateIHTForPlanAndYears = (planData, P) => {
+    const { 
+        nrb: StatutoryNRB, rnrb: StatutoryRNRB, isMarried, isResidenceToDescendants, 
+        hasTransferredNrb, hasTransferredRnrb, 
+        totalNonBRAssets, residenceValue, brAssets, 
+        totalLiabilities: totalLiabilitiesInput, 
+        exemptAssetsSpouseCharity, gifts, assetGrowthRate,
+        brAllocationPercentage: brAllocationPercent, 
+        pensionTrustAssets,
+    } = planData;
+
+    // Convert input percentage (0-100) to decimal (0-1)
+    const brAllocationDecimal = brAllocationPercent / 100;
+
+    // --- Derivation of effective current values based on planning ---
+    const transferAmount = totalNonBRAssets * brAllocationDecimal;
+    const effectiveCurrentNonBRAssets = totalNonBRAssets - transferAmount;
+    const effectiveCurrentBRAssets = brAssets + transferAmount;
+    
+    // --- BR 2-Year Holding Period Check (SIMPLIFIED LOGIC) ---
+    // We assume any new allocation only qualifies after year 2 (P >= 2).
+    let nonQualifyingTransferAmount = 0;
+    if (transferAmount > 0 && P < 2) {
+        // If projection is less than 2 years, the *transferred* amount is non-qualifying.
+        nonQualifyingTransferAmount = transferAmount;
+    }
+
+    // --- I. Project Asset Values ---
+    const R = 1 + assetGrowthRate;
+
+    const projectValue = (currentValue) => {
+        if (P <= 0 || R <= 1) return currentValue;
+        return currentValue * Math.pow(R, P);
+    };
+    
+    // Project all components
+    const projectedNonBRAssets = projectValue(effectiveCurrentNonBRAssets); 
+    const projectedResidenceValue = projectValue(residenceValue);
+    const projectedBRBase = projectValue(brAssets); // Original BR assets
+    const projectedBRTransfer = projectValue(transferAmount); // Transferred amount
+    const projectedExemptAssets = projectValue(exemptAssetsSpouseCharity);
+    const projectedPensionTrustAssets = projectValue(pensionTrustAssets); 
+
+    // Projected total BR assets
+    const projectedTotalBRAssets = projectedBRBase + projectedBRTransfer;
+    
+    // Calculate the actual non-qualifying amount at year P
+    const actualProjectedNonQualifyingTransfer = nonQualifyingTransferAmount > 0 ? projectValue(nonQualifyingTransferAmount) : 0; 
+
+    // Projected BR assets that are **chargeable** (i.e., failed 2-year rule on the transferred amount)
+    const projectedChargeableBRAssets = actualProjectedNonQualifyingTransfer; 
+
+    // Projected BR assets that are **fully exempt**
+    const projectedExemptBRAssets = projectedTotalBRAssets - projectedChargeableBRAssets;
+    
+    // Tax due on chargeable BR assets
+    const ihtOnChargeableBrAssets = projectedChargeableBRAssets * 0.40;
+
+    
+    // --- II. Calculate Gross Estate and Net Estate (Projected) ---
+    const projectedGrossEstate = projectedNonBRAssets + projectedResidenceValue + projectedTotalBRAssets + projectedExemptAssets + projectedPensionTrustAssets;
+    // Use the consolidated liability input
+    const totalLiabilities = totalLiabilitiesInput; 
+    const projectedNetEstate = projectedGrossEstate - totalLiabilities;
+    
+    // --- III. Calculate Nil Rate Bands (Projected) ---
+    const totalStatutoryNRB = StatutoryNRB + (isMarried && hasTransferredNrb ? StatutoryNRB : 0);
+    const maxCurrentRNRB = StatutoryRNRB;
+    const taperThreshold = 2000000;
+    
+    // RNRB TAPER: Reduction is £1 for every £2 the Net Estate exceeds £2m
+    let rnrbTaperAmount = 0;
+    // Note: Net Estate for taper test EXCLUDES pension/trust assets
+    const taperTestValue = projectedNetEstate - projectedPensionTrustAssets;
+    
+    if (taperTestValue > taperThreshold) {
+        rnrbTaperAmount = Math.max(0, (taperTestValue - taperThreshold) / 2);
+    }
+    
+    let currentRNRB = 0;
+    if (isResidenceToDescendants && projectedResidenceValue > 0) {
+        currentRNRB = Math.min(projectedResidenceValue, maxCurrentRNRB);
+    }
+    // Apply RNRB Taper to current RNRB
+    currentRNRB = Math.max(0, currentRNRB - rnrbTaperAmount);
+
+    const totalAvailableRNRB = currentRNRB + (isMarried && hasTransferredRnrb ? maxCurrentRNRB : 0);
+    const totalAvailableRelief = totalStatutoryNRB + totalAvailableRNRB;
+
+
+    // --- IV. Account for Gifts (PETs) and Advanced Exemptions (Projected) ---
+    let totalChargeableGifts = 0;
+    let totalTaxDueOnGifts = 0;
+
+    for (const gift of gifts) {
+        const giftValue = gift.value;
+        let taxableGiftValue = giftValue;
+        
+        // --- 1. Normal Expenditure Exemption (Highest Priority) ---
+        if (gift.isNormalExpenditure) {
+            taxableGiftValue = 0;
+        } else {
+
+            // --- 2. Marriage Exemption (Tiered Caps) ---
+            const marriageExemptions = { "Parent (£5k)": 5000, "Grandparent (£2.5k)": 2500, "Other (£1k)": 1000, "None": 0 };
+            const marriageExemptAmount = marriageExemptions[gift.marriageRelationship] || 0;
+            taxableGiftValue = Math.max(0, taxableGiftValue - marriageExemptAmount);
+
+            // --- 3. Small Gifts Exemption ---
+            const smallGiftsExemptAmount = (gift.smallGiftsUsed || 0) * 250;
+            taxableGiftValue = Math.max(0, taxableGiftValue - smallGiftsExemptAmount);
+
+            // --- 4. Annual Exemption & Carry-Forward ---
+            let annualExemptionUsed = 3000; // Current year allowance
+            if (gift.isPrevYearAnnualUnused) {
+                annualExemptionUsed += 3000; // Add previous year's carry-forward
+            }
+            taxableGiftValue = Math.max(0, taxableGiftValue - annualExemptionUsed);
+        }
+        
+        // Now calculate tax on the final chargeable amount
+        const chargeableAmount = Math.max(0, taxableGiftValue);
+        totalChargeableGifts += chargeableAmount;
+
+        const taperFactor = calculateTaperReliefFactor(gift.date, P);
+        const potentialTax = chargeableAmount * 0.40;
+        const taxDueOnGift = potentialTax * taperFactor;
+
+        totalTaxDueOnGifts += taxDueOnGift;
+    }
+    
+    // --- V. Calculate Taxable Estate at Death (Projected) ---
+    // Net Chargeable Estate includes: All assets - Liabilities - Exemptions (Spouse/Charity, BR, Pension)
+    const netChargeableEstate = Math.max(0, 
+        projectedNetEstate - 
+        projectedExemptAssets - 
+        projectedExemptBRAssets -
+        projectedPensionTrustAssets
+    );
+    
+    // We remove the Chargeable BR Assets value because the tax on them is handled separately below (ihtOnChargeableBrAssets)
+    const netChargeableEstatePreTaxableBR = Math.max(0, netChargeableEstate - projectedChargeableBRAssets);
+    
+    const effectiveAvailableRelief = Math.max(0, totalAvailableRelief - totalChargeableGifts);
+    
+    let taxableEstateAtDeath = Math.max(0, netChargeableEstatePreTaxableBR - effectiveAvailableRelief);
+
+    // --- VI. Final Liability Calculation (Projected) ---
+    let ihtOnEstate = taxableEstateAtDeath * 0.40;
+    
+    // Total liability includes tax on estate assets (net of relief), tax on gifts, AND tax on chargeable BR assets
+    const totalIHTLiability = ihtOnEstate + totalTaxDueOnGifts + ihtOnChargeableBrAssets; 
+    
+    // Projected BR Saving is the 40% tax avoided on the *exempt* portion of BR assets
+    const projectedBrSaving = projectedExemptBRAssets * 0.40;
+    
+    // Liability without BR (used for comparison)
+    const totalAssetsWithoutBR = projectedNonBRAssets + projectedResidenceValue + projectedTotalBRAssets + projectedExemptAssets + projectedPensionTrustAssets;
+    const netChargeableWithoutBR = Math.max(0, totalAssetsWithoutBR - projectedExemptAssets - projectedPensionTrustAssets);
+    const taxableWithoutBR = Math.max(0, netChargeableWithoutBR - effectiveAvailableRelief);
+    const liabilityWithoutBR = (taxableWithoutBR * 0.40) + totalTaxDueOnGifts;
+
+    // Total IHT Worth (used for client report)
+    const totalIHTWorth = projectedGrossEstate - projectedPensionTrustAssets; // Assets exposed to IHT (before liabilities/exemptions)
+
+    // Total True Worth (used for client report)
+    const totalTrueWorth = projectedGrossEstate; 
+
+
+    return {
+        projectedGrossEstate, 
+        projectedNetEstate, 
+        totalLiabilities, // Consolidated liability is returned
+        netChargeableEstate, 
+        effectiveAvailableRelief, 
+        totalAvailableRelief, 
+        totalChargeableGifts, 
+        taxableEstateAtDeath, 
+        totalIHTLiability,
+        projectedBrSaving,
+        liabilityWithoutBR, 
+        projectedNonBRAssets,
+        projectedResidenceValue,
+        projectedTotalBRAssets,
+        totalTaxDueOnGifts,
+        effectiveCurrentNonBRAssets, 
+        effectiveCurrentBRAssets,
+        projectedChargeableBRAssets, 
+        projectedExemptBRAssets,
+        ihtOnChargeableBrAssets, 
+        transferAmount,
+        rnrbTaperAmount, 
+        projectedPensionTrustAssets,
+        totalIHTWorth,
+        totalTrueWorth,
+        brAssets,
+        totalNonBRAssets
+    };
+};
+
+/** Function to generate 10-year projection data for the chart. */
+const calculateIHTProjectionSeries = (planData) => {
+    const series = [];
+    // Hard-code maxYears to 10 as requested
+    const maxYears = 10; 
+    
+    for (let i = 0; i <= maxYears; i++) {
+        const result = calculateIHTForPlanAndYears(planData, i);
+        
+        series.push({
+            year: i,
+            taxLiability: result.totalIHTLiability,
+            netChargeableEstate: result.netChargeableEstate,
+            taxableEstateAtDeath: result.taxableEstateAtDeath,
+            projectedGrossEstate: result.projectedGrossEstate,
+            projectedNonBRAssets: result.projectedNonBRAssets,
+            projectedBrAssets: result.projectedTotalBRAssets,
+            projectedExemptBRAssets: result.projectedExemptBRAssets,
+        });
+    }
+    return series;
+};
+
+
+// --- Default Data Structure ---
+const DEFAULT_PLAN = {
+    planId: crypto.randomUUID(),
+    planName: "Current Situation (Baseline)",
+    // Current IHT Parameters (2024/2025)
+    nrb: 325000, // Statutory NRB
+    rnrb: 175000, // Statutory RNRB
+    isMarried: true, // If claimed transferred NRB/RNRB
+    isResidenceToDescendants: true,
+    
+    // Simplified Transfer Claims (New Checkboxes)
+    hasTransferredNrb: true, // Claiming 100% of spouse's NRB
+    hasTransferredRnrb: true, // Claiming 100% of spouse's RNRB
+    
+    // Future Planning Input
+    assetGrowthRate: 0.05, // 5% annual growth
+    projectionYears: 0, 
+    brAllocationPercentage: 0, // Default to 0%
+    
+    // Estate Values (Current) (These are the *starting* pool amounts)
+    totalNonBRAssets: 1000000, 
+    residenceValue: 500000,
+    brAssets: 0, 
+    pensionTrustAssets: 200000, // IHT Exempt Asset
+    
+    // Liabilities (Consolidated)
+    totalLiabilities: 105000, 
+    exemptAssetsSpouseCharity: 0, 
+    
+    // Key Contact Details
+    firmName: 'Your Planning Firm',
+    executorName: 'Executor Name',
+    ifaContact: 'IFA/Solicitor Contact',
+    trustDetails: 'Trust Name/Date',
+
+
+    // Gifts (PETs)
+    gifts: [
+        { 
+            id: crypto.randomUUID(), 
+            value: 3000, 
+            date: new Date().toISOString().split('T')[0], 
+            isNormalExpenditure: false, 
+            isPrevYearAnnualUnused: false,
+            smallGiftsUsed: 0,
+            marriageRelationship: 'None' // None, Parent, Grandparent, Other
+        }, 
+        { 
+            id: crypto.randomUUID(), 
+            value: 100000, 
+            date: '2020-06-01',
+            isNormalExpenditure: false, 
+            isPrevYearAnnualUnused: false,
+            smallGiftsUsed: 0,
+            marriageRelationship: 'None'
+        }, 
+    ],
+};
+
+// Main Application Component
+const App = () => {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [planData, setPlanData] = useState(DEFAULT_PLAN);
+    const [allPlans, setAllPlans] = useState([]); // Array of all saved plan metadata
+    const [currentPlanId, setCurrentPlanId] = useState(null);
+    const [isLoading, setIsLoading] = useState(true);
+
+    const PLANS_COLLECTION = 'iht_plans';
+
+    // 1. Firebase Initialization and Authentication
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const authentication = getAuth(app);
+
+            setDb(firestore);
+            setAuth(authentication);
+
+            const unsubscribe = onAuthStateChanged(authentication, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(authentication, initialAuthToken);
+                    } else {
+                        const anonUser = await signInAnonymously(authentication);
+                        setUserId(anonUser.user.uid);
+                    }
+                }
+            });
+
+            return () => unsubscribe();
+        } catch (error) {
+            console.error("Firebase initialization failed:", error);
+            setIsLoading(false);
+        }
+    }, []);
+
+    // 2. Load All Plan Metadata
+    useEffect(() => {
+        if (!db || !userId) return;
+
+        const plansCollectionRef = collection(db, `/artifacts/${appId}/users/${userId}/${PLANS_COLLECTION}`);
+        
+        const unsubscribe = onSnapshot(plansCollectionRef, (snapshot) => {
+            const plans = [];
+            let foundCurrent = false;
+
+            snapshot.forEach(docSnap => {
+                const data = docSnap.data();
+                const planMeta = { id: docSnap.id, name: data.planName || 'Unnamed Plan', data };
+                plans.push(planMeta);
+                if (docSnap.id === currentPlanId) {
+                    setPlanData({ ...DEFAULT_PLAN, ...data, planId: docSnap.id });
+                    foundCurrent = true;
+                }
+            });
+
+            setAllPlans(plans);
+
+            if (!currentPlanId && plans.length > 0) {
+                setCurrentPlanId(plans[0].id);
+            } else if (!currentPlanId && plans.length === 0) {
+                const defaultId = DEFAULT_PLAN.planId;
+                setCurrentPlanId(defaultId);
+                savePlan({ ...DEFAULT_PLAN, planId: defaultId });
+            } else if (currentPlanId && !foundCurrent) {
+                 if (plans.length > 0) {
+                     setCurrentPlanId(plans[0].id);
+                 } else {
+                     setCurrentPlanId(null);
+                 }
+            }
+            setIsLoading(false);
+
+        }, (error) => {
+            console.error("Error reading all plans data:", error);
+            setIsLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [db, userId, currentPlanId]);
+
+    // 3. Data Saving Function
+    const savePlan = useCallback(async (data) => {
+        if (!db || !userId) return;
+
+        const planDocRef = doc(db, 
+            `/artifacts/${appId}/users/${userId}/${PLANS_COLLECTION}/${data.planId}`
+        );
+
+        try {
+            const dataToSave = {
+                ...data,
+                gifts: data.gifts.map(g => ({
+                    ...g,
+                    date: g.date 
+                }))
+            };
+            
+            await setDoc(planDocRef, dataToSave, { merge: true });
+        } catch (error) {
+            console.error("Error saving plan data:", error);
+        }
+    }, [db, userId]);
+
+    // 4. Plan Switching
+    const switchPlan = (planId) => {
+        const planToLoad = allPlans.find(p => p.id === planId);
+        if (planToLoad) {
+            setPlanData({ ...DEFAULT_PLAN, ...planToLoad.data, planId: planToLoad.id });
+            setCurrentPlanId(planId);
+        }
+    };
+
+    // 5. Create/Delete/Clone Functions
+    const createNewPlan = () => {
+        const newPlan = { 
+            ...planData, // Clone based on current plan for easy comparison
+            planId: crypto.randomUUID(), 
+            planName: `New Scenario ${allPlans.length + 1}` 
+        };
+        setPlanData(newPlan);
+        setCurrentPlanId(newPlan.planId);
+        savePlan(newPlan);
+    };
+
+    const cloneCurrentPlan = () => {
+        const clonedPlan = {
+            ...planData,
+            planId: crypto.randomUUID(),
+            planName: `${planData.planName} (Copy)`
+        };
+        setPlanData(clonedPlan);
+        setCurrentPlanId(clonedPlan.planId);
+        savePlan(clonedPlan);
+    };
+
+    const deleteCurrentPlan = async () => {
+        if (!db || !userId || !currentPlanId) return;
+
+        // Use a custom UI alert instead of window.confirm
+        const isConfirmed = () => {
+            // In a real application, this would open a modal component.
+            return true; // Assume confirmation for simplicity in this file for now
+        };
+        
+        if (allPlans.length <= 1) {
+            console.warn("Cannot delete the last remaining plan.");
+            return;
+        }
+
+        if (isConfirmed()) {
+            try {
+                const planDocRef = doc(db, `/artifacts/${appId}/users/${userId}/${PLANS_COLLECTION}/${currentPlanId}`);
+                await deleteDoc(planDocRef);
+                console.log(`Plan ${planData.planName} deleted.`);
+            } catch (error) {
+                console.error("Error deleting plan:", error);
+            }
+        }
+    };
+
+    // 6. Input Handlers
+    const handleInputChange = (e) => {
+        const { name, value, type, checked } = e.target;
+        
+        const isNumeric = ['nrb', 'rnrb', 'totalNonBRAssets', 'residenceValue', 'brAssets', 'totalLiabilities', 'exemptAssetsSpouseCharity', 'assetGrowthRate', 'brAllocationPercentage', 'pensionTrustAssets'].includes(name);
+        
+        let newValue = type === 'checkbox' ? checked : (isNumeric ? +value || 0 : value); 
+        if (name === 'assetGrowthRate') {
+            newValue = Math.max(0, Math.min(1, +value || 0));
+        }
+        if (name === 'brAllocationPercentage') {
+            newValue = Math.max(0, Math.min(100, +value || 0));
+        }
+
+        const updatedPlan = {
+            ...planData,
+            [name]: newValue
+        };
+        setPlanData(updatedPlan);
+        savePlan(updatedPlan);
+    };
+    
+    // Handler for BR Allocation on the right side
+    const handleBRAllocationChange = (e) => {
+        const value = +e.target.value || 0;
+        const newValue = Math.max(0, Math.min(100, value));
+        
+        const updatedPlan = {
+            ...planData,
+            brAllocationPercentage: newValue
+        };
+        setPlanData(updatedPlan);
+        savePlan(updatedPlan);
+    };
+
+
+    const handleGiftChange = (id, field, value) => {
+        const updatedGifts = planData.gifts.map(gift => {
+            if (gift.id === id) {
+                const newGift = { ...gift };
+                if (field === 'value' || field === 'smallGiftsUsed') {
+                    newGift[field] = +value || 0;
+                } else if (field === 'isNormalExpenditure' || field === 'isPrevYearAnnualUnused') {
+                     newGift[field] = value;
+                } else {
+                    newGift[field] = value;
+                }
+                
+                // Logic to disable other exemptions if Normal Expenditure is checked
+                if (field === 'isNormalExpenditure' && value) {
+                    newGift.isPrevYearAnnualUnused = false;
+                    newGift.smallGiftsUsed = 0;
+                    newGift.marriageRelationship = 'None';
+                }
+                
+                return newGift;
+            }
+            return gift;
+        });
+        
+        const updatedPlan = { ...planData, gifts: updatedGifts };
+        setPlanData(updatedPlan);
+        savePlan(updatedPlan);
+    };
+
+    const addGift = () => {
+        const newGift = { 
+            id: crypto.randomUUID(), 
+            value: 1000, 
+            date: new Date().toISOString().split('T')[0], 
+            isNormalExpenditure: false, 
+            isPrevYearAnnualUnused: false,
+            smallGiftsUsed: 0,
+            marriageRelationship: 'None' // None, Parent, Grandparent, Other
+        };
+        const updatedPlan = { ...planData, gifts: [...planData.gifts, newGift] };
+        setPlanData(updatedPlan);
+        savePlan(updatedPlan);
+    };
+
+    const removeGift = (id) => {
+        const updatedGifts = planData.gifts.filter(gift => gift.id !== id);
+        const updatedPlan = { ...planData, gifts: updatedGifts };
+        setPlanData(updatedPlan);
+        savePlan(updatedPlan);
+    };
+
+
+    // 7. Memoized Calculation (Uses the utility functions)
+    const calculation = useMemo(() => {
+        // Always calculate the current view (P=0) and the full 10-year projection
+        const currentCalculation = calculateIHTForPlanAndYears(planData, 0);
+        const projectionSeries = calculateIHTProjectionSeries(planData);
+        
+        // Find the 10-year projected calculation for display purposes
+        const projected10YearCalculation = projectionSeries.find(s => s.year === 10);
+
+        return {
+            ...currentCalculation,
+            projectionSeries,
+            projected10YearCalculation,
+        };
+    }, [planData]);
+
+
+    // --- UI Components ---
+    
+    // Logo SVG (NEW)
+    const LegacyCalcLogo = () => (
+        <svg className="w-10 h-10 text-indigo-700 inline-block align-middle mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z" />
+        </svg>
+    );
+    
+    // Helper component for styled input fields
+    const InputField = ({ label, name, value, onChange, type = 'number', prefix = '£', tip = null, disabled = false, step = '1' }) => {
+        // Input fields inside the blueish background should be white
+        const inputClasses = `block w-full rounded-lg border-gray-300 py-2 ${prefix === '£' ? 'pl-8' : 'pl-3'} ${type === 'number' && prefix !== '%' ? 'pr-3' : 'pr-3'} focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm ${type === 'checkbox' ? 'w-auto h-5' : ''} ${disabled ? 'bg-gray-100 text-gray-500' : 'bg-white'}`;
+        
+        return (
+            <div className="flex flex-col mb-4">
+                <label className="text-sm font-medium text-gray-700 mb-1">{label}</label>
+                <div className="relative rounded-lg shadow-sm">
+                    {type === 'number' && prefix !== '%' && (
+                        <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+                            <span className="text-gray-500 sm:text-sm">{prefix}</span>
+                        </div>
+                    )}
+                    <input
+                        type={type}
+                        name={name}
+                        value={value}
+                        onChange={onChange}
+                        disabled={disabled}
+                        step={step}
+                        className={inputClasses}
+                        placeholder={type === 'number' ? '0' : ''}
+                        min={type === 'number' ? 0 : undefined}
+                    />
+                     {type === 'number' && prefix === '%' && (
+                        <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3">
+                            <span className="text-gray-500 sm:text-sm">%</span>
+                        </div>
+                    )}
+                </div>
+                {tip && <p className="mt-1 text-xs text-gray-400">{tip}</p>}
+            </div>
+        );
+    };
+    
+    // Checkbox field for NRB/RNRB transfers (Simplified)
+    const TransferCheckbox = ({ label, name, checked, onChange }) => (
+        <div className="flex items-center space-x-2 mb-4 border-b pb-4">
+            <input
+                type="checkbox"
+                name={name}
+                checked={checked}
+                onChange={onChange}
+                className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+            />
+            <label className="text-sm font-medium text-gray-700 flex-grow">
+                {label}
+            </label>
+        </div>
+    );
+
+    const StatItem = ({ label, value, isPrimary = false, isNegative = false, isPositive = false, isHighlight = false, isNeutral = false, formula = null }) => {
+        let colorClass = 'text-gray-700'; // Default text color
+        if (isPrimary) colorClass = 'text-gray-800 font-bold';
+        if (isNegative && value > 0) colorClass = 'text-red-600'; // Cost/Negative impact
+        if (isPositive && value > 0) colorClass = 'text-green-600'; // Saving/Exemption
+        if (isHighlight) colorClass = 'text-indigo-600 font-bold';
+        if (isNeutral) colorClass = 'text-gray-800'; // Neutral asset
+        
+        // Add a clean separator for primary/highlight items
+        const itemClass = isPrimary || isHighlight ? 'border-t border-gray-200 pt-2' : '';
+
+        return (
+            <div className={`flex justify-between items-center text-sm ${itemClass}`}>
+                <span className="font-medium flex items-center">
+                    {label}
+                    {formula && <span className="ml-2 text-xs text-gray-500 font-normal">({formula})</span>}
+                </span>
+                <span className={`font-semibold ${colorClass}`}>
+                    {formatCurrency(value)}
+                </span>
+            </div>
+        );
+    };
+
+    // --- BR Planning Visualizer Component (Consolidates Shifter and Chart) ---
+    const BRPlanningVisualizer = ({ calc, brAllocationPercentage, handleBRAllocationChange }) => {
+        
+        const maxTaxLiability = Math.max(...calc.projectionSeries.map(s => s.taxLiability), 1);
+        
+        // Find projected liability at year 10 for display
+        const projected10YearLiability = calc.projectionSeries.find(s => s.year === 10)?.taxLiability || 0;
+
+
+        // 10 Year IHT Trend Chart
+        const TrendChart = ({ series, title }) => {
+            
+            // Check if Bar component is defined (prevents rendering errors if ChartJS import failed)
+            if (typeof Bar === 'undefined' || typeof ChartJS === 'undefined') {
+                return <div className="text-center p-8 text-gray-500">Chart loading...</div>;
+            }
+            
+            // Chart data structure
+            const data = {
+                labels: series.map(d => d.year),
+                datasets: [{
+                    label: 'IHT Liability',
+                    data: series.map(d => d.taxLiability),
+                    backgroundColor: series.map(d => {
+                        if (d.year === 0) return 'rgba(16, 185, 129, 1)'; // green-600 (Current)
+                        if (d.year === 2) return 'rgba(245, 158, 11, 1)'; // yellow-500 (BR Qualify)
+                        if (d.year > 2 && d.year < 7) return 'rgba(99, 102, 241, 0.7)'; // Indigo (Taper Period)
+                        if (d.year === 7) return 'rgba(96, 165, 250, 1)'; // Blue-400 (Taper Ends)
+                        return 'rgba(99, 102, 241, 1)'; // Default Indigo
+                    }),
+                    borderRadius: 4,
+                    barPercentage: 0.8,
+                    categoryPercentage: 0.8
+                }]
+            };
+
+            // Chart options
+            const options = {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: (context) => formatCurrency(context.parsed.y)
+                        }
+                    },
+                    datalabels: { // To avoid conflicts, we'll manually draw labels
+                        display: false
+                    }
+                },
+                scales: {
+                    x: {
+                        title: { display: true, text: 'Years into Projection' },
+                        grid: { display: false },
+                        // Custom ticks to highlight key years
+                        ticks: {
+                            callback: function(val, index) {
+                                const year = series[index].year;
+                                if (year === 0) return 'Yr 0 (Now)';
+                                if (year === 2) return 'Yr 2 (BR)';
+                                if (year === 7) return 'Yr 7 (Gifts)';
+                                if (year % 5 === 0) return `Yr ${year}`;
+                                return null;
+                            },
+                            // Set font color for highlighted years
+                            font: (context) => {
+                                const year = series[context.tick.value].year;
+                                if (year === 0) return { weight: 'bold', color: 'rgba(16, 185, 129, 1)' };
+                                if (year === 2) return { weight: 'bold', color: 'rgba(245, 158, 11, 1)' };
+                                if (year === 7) return { weight: 'bold', color: 'rgba(96, 165, 250, 1)' };
+                                return { color: 'rgba(107, 114, 128, 1)' };
+                            }
+                        }
+                    },
+                    y: {
+                        title: { display: true, text: 'IHT Liability' },
+                        beginAtZero: true,
+                        ticks: {
+                            callback: (value) => formatCurrency(value)
+                        }
+                    }
+                }
+            };
+            
+            // Custom Bar component to draw labels only on year 0 and 10
+            const BarWithLabels = () => {
+                const chartRef = React.useRef(null);
+                
+                useEffect(() => {
+                    const chart = chartRef.current;
+                    if (!chart) return;
+                    
+                    const ctx = chart.ctx;
+                    
+                    // Clear previous custom labels
+                    // chart.draw(); // Removed to prevent double drawing
+                    
+                    // Draw custom labels for Year 0 and Year 10
+                    series.forEach((dataPoint, index) => {
+                        if (dataPoint.year === 0 || dataPoint.year === 10) {
+                            const meta = chart.getDatasetMeta(0)?.data[index];
+                            if (meta) {
+                                const x = meta.x;
+                                const y = meta.y;
+                                
+                                const value = formatCurrency(dataPoint.taxLiability);
+                                const color = dataPoint.year === 0 ? '#10B981' : '#4F46E5'; // Green for Year 0, Indigo for Year 10
+                                
+                                ctx.fillStyle = color;
+                                ctx.textAlign = 'center';
+                                ctx.font = 'bold 10px sans-serif';
+                                ctx.fillText(value, x, y - 10);
+                            }
+                        }
+                    });
+
+                }, [series]); // Redraw on series change
+
+
+                return <Bar ref={chartRef} data={data} options={options} />;
+            };
+            
+
+            return (
+                <div className="mb-6 p-4 bg-white rounded-xl shadow-inner border border-gray-200">
+                    <h3 className="text-lg font-bold text-gray-800 mb-6">{title}</h3>
+                    <div className="h-64 relative px-2">
+                         <BarWithLabels />
+                    </div>
+                </div>
+            );
+        };
+        
+
+        return (
+            <div className="space-y-6">
+                
+                {/* 1. BR Allocation Shifter (Top of modeling section) */}
+                <div className="p-4 bg-sky-50 rounded-xl shadow border border-indigo-200">
+                    <h3 className="text-lg font-bold text-indigo-700 mb-3">BR Allocation Modeler</h3>
+                    <div className='flex items-end space-x-4'>
+                        <div className='flex-grow'>
+                            <InputField 
+                                label="Shift % of Non-BR Assets to BR" 
+                                name="brAllocationPercentage" 
+                                value={brAllocationPercentage} 
+                                onChange={handleBRAllocationChange}
+                                type="number"
+                                prefix="%"
+                                tip="Adjust to model IHT savings."
+                                step="5"
+                            />
+                        </div>
+                        <div className='flex-grow'>
+                            <StatItem 
+                                label="Projected IHT Saving from BR (Year 10)" 
+                                value={calc.projectedBrSaving} 
+                                isPositive={calc.projectedBrSaving > 0} 
+                                isHighlight={true}
+                                formula={`Difference at Year 10`}
+                            />
+                        </div>
+                    </div>
+                </div>
+                
+                {/* 2. Trend Chart (Directly below shifter) */}
+                <TrendChart 
+                    series={calc.projectionSeries} 
+                    title="IHT Liability Trend Over 10 Years" 
+                />
+
+                {/* 3. ASSET MODELING DETAIL (Below the chart) */}
+                <div className="p-4 bg-sky-50 rounded-xl shadow border border-indigo-200">
+                    <h3 className="text-lg font-bold text-indigo-700 mb-3 border-b pb-2">Modeled Asset Pools (Current Value)</h3>
+                    <StatItem label="Starting Non-BR Asset Pool" value={calc.totalNonBRAssets} isNeutral={true} />
+                    <StatItem 
+                        label={`(-) Modeled Shift (${brAllocationPercentage}%)`} 
+                        value={-calc.transferAmount} 
+                        isNegative={calc.transferAmount > 0}
+                    />
+                    <StatItem 
+                        label="Final Non-BR Asset Pool (Modeled)" 
+                        value={calc.effectiveCurrentNonBRAssets} 
+                        isPrimary={true} 
+                        isNeutral={true}
+                    />
+                    
+                    <div className='mt-4 pt-2 border-t border-indigo-200'>
+                        <StatItem label="Starting BR Asset Pool" value={calc.brAssets} isNeutral={true} />
+                        <StatItem 
+                            label="(+) Modeled Shift" 
+                            value={calc.transferAmount} 
+                            isPositive={calc.transferAmount > 0}
+                        />
+                        <StatItem 
+                            label="Final BR Asset Pool (Modeled)" 
+                            value={calc.effectiveCurrentBRAssets} 
+                            isPrimary={true} 
+                            isNeutral={true}
+                        />
+                    </div>
+                </div>
+            </div>
+        );
+    };
+    // --- END BR Planning Visualizer Component ---
+
+
+    const ResultSummary = ({ calc, planData, handleBRAllocationChange }) => {
+        
+        const liabilityColorCurrent = 'text-red-600';
+        const currentLiability = calc.projectionSeries.find(s => s.year === 0)?.taxLiability || 0;
+
+
+        return (
+            <div className="bg-white text-gray-800 p-6 rounded-xl shadow-xl border border-gray-200 font-serif">
+                <h2 className="text-2xl font-bold text-gray-800 mb-4 pb-2">
+                    IHT Planning Analysis
+                </h2>
+                
+                {/* 1. CURRENT LIABILITY (TOP PRIORITY) */}
+                <div className="mb-4 pb-4">
+                    <h3 className="text-lg font-bold text-gray-700">Current IHT Liability (Year 0)</h3>
+                    <p className={`text-4xl font-extrabold ${liabilityColorCurrent} mt-1 text-left`}>
+                        {formatCurrency(currentLiability)}
+                    </p>
+                </div>
+                
+                {/* 2. CORE CALCULATION FLOW: Estate Breakdown and Tax Calculation */}
+                <div className="space-y-5 mt-8 pt-4">
+                    <h3 className="text-2xl font-bold text-indigo-700">Estate Breakdown and Tax Calculation</h3>
+                    
+                    {/* A. Gross Estate and Net Estate */}
+                    <div className="space-y-3">
+                        <h4 className="text-lg font-semibold text-gray-800 border-b pb-1">Gross Estate & Liabilities</h4>
+                        <StatItem label="Total True Worth (Gross Assets)" value={calc.totalTrueWorth} isPrimary={true} />
+                        <StatItem label="(-) Total Liabilities & Expenses" value={-calc.totalLiabilities} isNegative={true} />
+                        <StatItem label="Net Estate Value (IHT Taper Test Value)" value={calc.projectedNetEstate} isPrimary={true} isHighlight={true} />
+                    </div>
+
+                    {/* B. Composition & Exemptions */}
+                    <div className="space-y-3 pt-3 border-t border-gray-200">
+                        <h4 className="text-lg font-semibold text-gray-800 border-b pb-1">Composition & Exemptions</h4>
+                        
+                        <StatItem label="Pension/Trust Assets (IHT Exempt)" value={calc.projectedPensionTrustAssets} isPositive={true} />
+                        <StatItem label="Exempt Assets (Spouse/Charity)" value={planData.exemptAssetsSpouseCharity} isPositive={true} />
+                        <StatItem label="Exempt BR Assets" value={calc.projectedExemptBRAssets} isPositive={true} />
+                        
+                        {/* Chargeable BR Tax Cost */}
+                        <StatItem 
+                            label="Tax on Chargeable BR Assets (<2yr Test Failed)" 
+                            value={calc.ihtOnChargeableBrAssets} 
+                            isNegative={calc.ihtOnChargeableBrAssets > 0} 
+                            isPrimary={true} 
+                        />
+                    </div>
+                    
+                    {/* C. Chargeable Estate and NRBs */}
+                    <div className="space-y-3 pt-3 border-t border-gray-200">
+                        <h4 className="text-lg font-semibold text-gray-800 border-b pb-1">Chargeable Estate & Reliefs</h4>
+                        
+                        <StatItem 
+                            label="Net Chargeable Estate (Pre-NRB)" 
+                            value={calc.netChargeableEstate} 
+                            isPrimary={true} 
+                            formula="Net Estate - All Exemptions"
+                        />
+                        <StatItem 
+                            label="(-) Total Available NRBs (After Gifts)" 
+                            value={-calc.effectiveAvailableRelief} 
+                            isPositive={true} 
+                            formula="Max NRB/RNRB - Chargeable Gifts"
+                        />
+                        
+                        {/* Final Taxable Amount */}
+                        <StatItem 
+                            label="Estate Taxable at 40%" 
+                            value={calc.taxableEstateAtDeath} 
+                            isNegative={true} 
+                            isPrimary={true} 
+                            isHighlight={true}
+                            formula="Net Chargeable Estate - Total Available NRBs" 
+                        />
+                        <StatItem label="Tax Due on Gifts (Post Taper)" value={calc.totalTaxDueOnGifts} isNegative={true} />
+                    </div>
+                </div>
+
+                {/* 3. VISUALS & MODELING (BR Shifter + 10-Year Chart) */}
+                <div className='mt-8 pt-4 border-t border-gray-200'>
+                    <BRPlanningVisualizer 
+                        calc={calculationForDisplay} 
+                        brAllocationPercentage={planData.brAllocationPercentage}
+                        handleBRAllocationChange={handleBRAllocationChange} 
+                    />
+                </div>
+                
+
+                {/* 4. SUPPORTING ANALYSIS (Moved to the bottom) */}
+                
+                {/* RNRB Tapering Analysis */}
+                <div className="mt-8 pt-4 border-t border-gray-200 space-y-3 p-4 bg-gray-50 rounded-lg shadow-inner">
+                    <h3 className="text-xl font-bold text-indigo-700">RNRB Tapering Analysis</h3>
+                    <StatItem label="Net Estate Taper Threshold" value={2000000} isNeutral={true} />
+                    <StatItem 
+                        label="Net Estate Excess over £2m" 
+                        value={Math.max(0, calc.projectedNetEstate - 2000000)} 
+                        isNegative={calc.projectedNetEstate > 2000000} 
+                        isPrimary={true} 
+                    />
+                    <StatItem label="Total RNRB Taper Applied" value={calc.rnrbTaperAmount} isNegative={true} isHighlight={true} />
+                    <p className="text-xs text-gray-500 pt-1">
+                        *The RNRB is reduced by £1 for every £2 the Net Estate exceeds the £2 million threshold. Strategic BR allocation can mitigate this taper by reducing the Net Estate.
+                    </p>
+                </div>
+            </div>
+        );
+    };
+
+    const ScenarioControls = () => (
+        <div className="bg-white p-4 rounded-xl shadow-lg border border-gray-100 mt-8 font-serif">
+            <h2 className="text-xl font-bold text-gray-800 mb-3 border-b pb-2">Scenario Planning</h2>
+            
+            <div className="flex flex-wrap items-center space-x-2 space-y-2">
+                <select
+                    value={currentPlanId}
+                    onChange={(e) => switchPlan(e.target.value)}
+                    className="flex-grow py-2 px-3 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                >
+                    {allPlans.map(plan => (
+                        <option key={plan.id} value={plan.id}>
+                            {plan.name}
+                        </option>
+                    ))}
+                </select>
+
+                <button
+                    onClick={createNewPlan}
+                    className="flex-shrink-0 px-4 py-2 border border-transparent text-sm font-medium rounded-lg text-white bg-green-600 hover:bg-green-700 transition duration-150"
+                >
+                    + New Plan
+                </button>
+                <button
+                    onClick={cloneCurrentPlan}
+                    className="flex-shrink-0 px-4 py-2 border border-transparent text-sm font-medium rounded-lg text-white bg-indigo-600 hover:bg-indigo-700 transition duration-150"
+                >
+                    Clone
+                </button>
+                <button
+                    onClick={deleteCurrentPlan}
+                    disabled={allPlans.length <= 1}
+                    className={`flex-shrink-0 px-4 py-2 border border-transparent text-sm font-medium rounded-lg text-white transition duration-150 ${allPlans.length <= 1 ? 'bg-gray-400 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'}`}
+                >
+                    Delete
+                </button>
+            </div>
+        </div>
+    );
+
+    const KeyContacts = ({ value, onChange }) => (
+        <div className="bg-sky-100 p-6 rounded-xl shadow-lg border border-indigo-200 font-serif">
+            <h2 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Key Contacts & Firm Branding</h2>
+            <InputField 
+                label="Firm/Estate Name (for Report)" 
+                name="firmName" 
+                value={value.firmName} 
+                onChange={onChange}
+                type="text"
+                prefix=""
+            />
+            <InputField 
+                label="Executor / Trustee Name" 
+                name="executorName" 
+                value={value.executorName} 
+                onChange={onChange}
+                type="text"
+                prefix=""
+            />
+            <InputField 
+                label="Solicitor / IFA Contact" 
+                name="ifaContact" 
+                value={value.ifaContact} 
+                onChange={onChange}
+                type="text"
+                prefix=""
+            />
+            <InputField 
+                label="Trust Details (Name/Date)" 
+                name="trustDetails" 
+                value={value.trustDetails} 
+                onChange={onChange}
+                type="text"
+                prefix=""
+                tip="Details for quick reference during an event."
+            />
+        </div>
+    );
+
+    const ControlPanel = ({ value, onChange }) => (
+        // Inner section uses unified blue background
+        <div className="bg-sky-100 p-6 rounded-xl shadow-lg border border-indigo-200 font-serif">
+            <h2 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">IHT Parameters & Growth</h2>
+            
+            <h3 className="text-md font-semibold text-gray-700 mt-2 mb-2">Future Growth</h3>
+            <div className="grid grid-cols-2 gap-4 border-b pb-4 mb-4">
+                <InputField label="Asset Growth Rate" 
+                    name="assetGrowthRate" 
+                    value={value.assetGrowthRate} 
+                    onChange={onChange}
+                    type="number"
+                    prefix="%"
+                    tip="e.g. 0.05 for 5% annual growth (used for 10-year trend)"
+                    step="0.01"
+                />
+            </div>
+            
+            <h3 className="text-md font-semibold text-gray-700 mt-6 mb-2 border-t pt-4">Nil Rate Bands (NRB)</h3>
+
+            {/* NRB */}
+            <div className="grid grid-cols-2 gap-4">
+                <div className="flex flex-col mb-4">
+                     <label className="text-sm font-medium text-gray-700 mb-1">
+                        Statutory NRB 
+                    </label>
+                    <p className='text-sm text-gray-800 p-2 bg-white rounded-lg shadow-sm'>{formatCurrency(value.nrb)}</p>
+                </div>
+                <TransferCheckbox 
+                    label="Claim Transferred NRB"
+                    name="hasTransferredNrb"
+                    checked={value.hasTransferredNrb}
+                    onChange={onChange}
+                />
+            </div>
+            
+            {/* RNRB */}
+            <h3 className="text-md font-semibold text-gray-700 mt-4 mb-2 border-t pt-4">Residence Nil Rate Bands (RNRB)</h3>
+            <div className="grid grid-cols-2 gap-4">
+                <div className="flex flex-col mb-4">
+                    <label className="text-sm font-medium text-gray-700 mb-1">
+                        Statutory RNRB 
+                    </label>
+                    <p className='text-sm text-gray-800 p-2 bg-white rounded-lg shadow-sm'>{formatCurrency(value.rnrb)}</p>
+                </div>
+                <TransferCheckbox 
+                    label="Claim Transferred RNRB"
+                    name="hasTransferredRnrb"
+                    checked={value.hasTransferredRnrb}
+                    onChange={onChange}
+                />
+            </div>
+
+            <div className="flex items-center space-x-2 mt-4">
+                <input
+                    type="checkbox"
+                    name="isResidenceToDescendants"
+                    checked={value.isResidenceToDescendants}
+                    onChange={onChange}
+                    className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+                />
+                <label className="text-sm font-medium text-gray-700">Residence left to direct descendants?</label>
+            </div>
+        </div>
+    );
+
+    const EstateBreakdown = ({ value, onChange }) => (
+        // Inner section uses unified blue background
+        <div className="bg-sky-100 p-6 rounded-xl shadow-lg border border-indigo-200 font-serif">
+            <h2 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Estate & Liabilities Breakdown (Starting Value)</h2>
+            
+            {/* ASSETS */}
+            <h3 className="text-md font-semibold text-indigo-600 mt-4 mb-2">Assets (Gross Estate)</h3>
+            
+            {/* Non-BR Assets */}
+            <div className="border-b pb-4 mb-4">
+                <InputField 
+                    label="Non-BR Assets (Investments, Cash, etc.)" 
+                    name="totalNonBRAssets" 
+                    value={value.totalNonBRAssets} 
+                    onChange={onChange} 
+                    tip="Original pool size. Assets fully exposed to IHT."
+                />
+            </div>
+
+            {/* BR Assets */}
+            <div className="border-b pb-4 mb-4">
+                <InputField 
+                    label="BR-Qualifying Assets" 
+                    name="brAssets" 
+                    value={value.brAssets} 
+                    onChange={onChange}
+                    tip="Original BR holding. Subject to 2-year holding test." 
+                />
+            </div>
+            
+            {/* Residence */}
+            <InputField label="Residence Value" name="residenceValue" value={value.residenceValue} onChange={onChange} />
+            
+            {/* Exempt Spouse/Charity */}
+            <InputField 
+                label="Exempt Assets (Passing to Spouse/Charity)" 
+                name="exemptAssetsSpouseCharity" 
+                value={value.exemptAssetsSpouseCharity} 
+                onChange={onChange}
+                tip="These assets are 100% IHT exempt." 
+            />
+            
+            {/* Pension/Trust Assets */}
+             <InputField 
+                label="Pension/Trust Assets (IHT Exempt)" 
+                name="pensionTrustAssets" 
+                value={value.pensionTrustAssets} 
+                onChange={onChange}
+                tip="Assets usually held outside the estate for IHT purposes." 
+            />
+
+            {/* LIABILITIES (Consolidated) */}
+            <h3 className="text-md font-semibold text-red-600 mt-6 mb-2 border-t pt-4">Liabilities & Expenses (Assumed Static)</h3>
+             <InputField 
+                label="Total Liabilities & Expenses" 
+                name="totalLiabilities" 
+                value={value.totalLiabilities} 
+                onChange={onChange}
+                tip="Includes mortgages, general debts, and estimated funeral/probate costs."
+            />
+        </div>
+    );
+
+    const GiftSummaryTable = ({ gifts }) => {
+        // Find the result of the calculation for the current year (P=0)
+        // const currentResult = calculateIHTForPlanAndYears(DEFAULT_PLAN, 0); // Removed as it causes issues when planData structure changes
+
+        // We need to re-run the gift calculation logic here to get per-gift details for display
+        const getGiftDetails = (gift) => {
+            let taxableGiftValue = gift.value;
+            let exemptionsApplied = [];
+
+            // 1. Normal Expenditure Exemption
+            if (gift.isNormalExpenditure) {
+                taxableGiftValue = 0;
+                exemptionsApplied.push('Normal Expenditure (100%)');
+            } else {
+                
+                // 2. Marriage Exemption
+                const marriageExemptions = { "Parent (£5k)": 5000, "Grandparent (£2.5k)": 2500, "Other (£1k)": 1000, "None": 0 };
+                const marriageExemptAmount = marriageExemptions[gift.marriageRelationship] || 0;
+                if (marriageExemptAmount > 0) {
+                    exemptionsApplied.push(gift.marriageRelationship);
+                    taxableGiftValue = Math.max(0, taxableGiftValue - marriageExemptAmount);
+                }
+
+                // 3. Small Gifts Exemption
+                const smallGiftsExemptAmount = (gift.smallGiftsUsed || 0) * 250;
+                if (smallGiftsExemptAmount > 0) {
+                    exemptionsApplied.push(`Small Gifts (x${gift.smallGiftsUsed})`);
+                    taxableGiftValue = Math.max(0, taxableGiftValue - smallGiftsExemptAmount);
+                }
+
+                // 4. Annual Exemption & Carry-Forward
+                let annualExemptionUsed = 3000; // Current year allowance
+                let exemptionLabel = 'Annual (£3k)';
+                if (gift.isPrevYearAnnualUnused) {
+                    annualExemptionUsed += 3000; // Add previous year's carry-forward
+                    exemptionLabel = 'Annual + Carry-Forward (£6k)';
+                }
+                taxableGiftValue = Math.max(0, taxableGiftValue - annualExemptionUsed);
+                if (annualExemptionUsed > 0) {
+                     exemptionsApplied.push(exemptionLabel);
+                }
+            }
+
+            const chargeableAmount = Math.max(0, taxableGiftValue);
+            const taperFactor = calculateTaperReliefFactor(gift.date, 0);
+            const liabilityFactor = taperFactor * 100;
+            const taxLiability = chargeableAmount * 0.40 * taperFactor;
+            
+            return {
+                chargeableAmount,
+                taxLiability,
+                liabilityFactor,
+                exemptions: exemptionsApplied.join(' + ') || 'None Claimed',
+            };
+        };
+
+        if (gifts.length === 0) return null;
+
+        return (
+            <div className="mt-6 p-4 bg-white rounded-lg shadow-inner border border-gray-200 overflow-x-auto">
+                <h3 className="text-lg font-bold text-gray-800 mb-3 border-b pb-2">Gift Summary Table (Current View)</h3>
+                <table className="min-w-full divide-y divide-gray-300">
+                    <thead className="bg-gray-50">
+                        <tr>
+                            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Gift Value</th>
+                            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Taper % Tax</th>
+                            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Chargeable (£)</th>
+                            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">IHT Due</th>
+                        </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                        {gifts.map(gift => {
+                            const details = getGiftDetails(gift);
+                            return (
+                                <tr key={gift.id} className="hover:bg-indigo-50 transition duration-100">
+                                    <td className="px-3 py-2 whitespace-nowrap text-sm font-medium text-gray-900">{formatCurrency(gift.value)}</td>
+                                    <td className="px-3 py-2 whitespace-nowrap text-xs text-gray-500">{gift.date}</td>
+                                    <td className="px-3 py-2 whitespace-nowrap text-sm font-medium text-red-600">{details.liabilityFactor.toFixed(0)}%</td>
+                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-gray-700">{formatCurrency(details.chargeableAmount)}</td>
+                                    <td className="px-3 py-2 whitespace-nowrap text-sm font-semibold text-red-600">{formatCurrency(details.taxLiability)}</td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            </div>
+        );
+    };
+
+
+    const GiftsTracker = ({ gifts, handleGiftChange, addGift, removeGift }) => (
+        // Inner section uses unified blue background
+        <div className="bg-sky-100 p-6 rounded-xl shadow-lg border border-indigo-200 font-serif">
+            <h2 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Gift (PET) Tracker</h2>
+
+            <div className="space-y-4">
+                {gifts.map((gift) => {
+                    const liabilityFactor = calculateTaperReliefFactor(gift.date, 0) * 100;
+                    const isDisabled = gift.isNormalExpenditure;
+
+                    return (
+                        <div key={gift.id} className="p-4 border border-indigo-100 bg-white rounded-lg">
+                            
+                            {/* Value and Date Row - STACKED */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <InputField 
+                                        label="Gift Value" 
+                                        value={gift.value} 
+                                        onChange={(e) => handleGiftChange(gift.id, 'value', e.target.value)}
+                                    />
+                                    <InputField 
+                                        label="Date Given" 
+                                        type="date" 
+                                        prefix=""
+                                        value={gift.date} 
+                                        onChange={(e) => handleGiftChange(gift.id, 'date', e.target.value)}
+                                    />
+                                </div>
+                                <div className='pt-1'>
+                                    {/* Exemption Column */}
+                                    <p className="text-xs font-semibold text-gray-600 mb-3">Claim IHT Exemptions:</p>
+
+                                    {/* Row 1: Normal Expenditure & Marriage */}
+                                    <div className="space-y-3 mb-4">
+                                        
+                                        {/* Normal Expenditure */}
+                                        <div className='bg-red-50 p-2 rounded'>
+                                            <div className="flex items-center">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={gift.isNormalExpenditure}
+                                                    onChange={(e) => handleGiftChange(gift.id, 'isNormalExpenditure', e.target.checked)}
+                                                    className="h-4 w-4 text-green-600 border-gray-300 rounded focus:ring-green-500"
+                                                />
+                                                <label className="ml-2 text-sm font-medium text-gray-700">Normal Expenditure (Unlimited)</label>
+                                            </div>
+                                            <p className="text-xs text-gray-500 mt-1">
+                                                *If checked, this gift is 100% exempt.
+                                            </p>
+                                        </div>
+                                        
+                                        {/* Marriage Exemption (Dropdown) */}
+                                        <div className='flex flex-col'>
+                                            <label className="text-sm font-medium text-gray-700 mb-1">Marriage Gift Donor</label>
+                                            <select
+                                                value={gift.marriageRelationship}
+                                                onChange={(e) => handleGiftChange(gift.id, 'marriageRelationship', e.target.value)}
+                                                disabled={isDisabled}
+                                                className="block w-full rounded-lg border-gray-300 py-2 pl-3 pr-8 sm:text-sm bg-white disabled:bg-gray-100"
+                                            >
+                                                <option value="None">None</option>
+                                                <option value="Parent (£5k)">Parent (£5,000 max)</option>
+                                                <option value="Grandparent (£2.5k)">Grandparent (£2,500 max)</option>
+                                                <option value="Other (£1k)">Other/Friend (£1,000 max)</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    
+                                    {/* Row 2: Annual & Small Gifts */}
+                                    <div className="pt-3 border-t border-gray-100 space-y-3">
+                                        {/* Annual Exemption Carry Forward */}
+                                        <div className="flex items-center">
+                                            <input
+                                                type="checkbox"
+                                                checked={gift.isPrevYearAnnualUnused}
+                                                onChange={(e) => handleGiftChange(gift.id, 'isPrevYearAnnualUnused', e.target.checked)}
+                                                disabled={isDisabled}
+                                                className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500 disabled:bg-gray-200"
+                                            />
+                                            <label className="ml-2 text-sm font-medium text-gray-700">Claim £3k Carry-Forward</label>
+                                        </div>
+
+                                        {/* Small Gifts */}
+                                        <InputField
+                                            label="Small Gifts (x £250)"
+                                            name="smallGiftsUsed"
+                                            value={gift.smallGiftsUsed}
+                                            onChange={(e) => handleGiftChange(gift.id, 'smallGiftsUsed', e.target.value)}
+                                            type="number"
+                                            prefix="x"
+                                            step="1"
+                                            disabled={isDisabled}
+                                        />
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Taper Relief Status & Remove */}
+                            <div className="mt-4 pt-3 border-t border-gray-200 flex justify-between items-center">
+                                <p className="text-sm font-bold text-gray-700">
+                                    Taper Relief Status (Current): 
+                                    <span className={`ml-2 ${liabilityFactor < 100 ? 'text-green-600' : 'text-red-600'}`}>
+                                        {liabilityFactor.toFixed(0)}% Tax Liability Remaining
+                                    </span>
+                                </p>
+                                <button
+                                    onClick={() => removeGift(gift.id)}
+                                    className="text-xs text-red-600 hover:text-red-800 transition duration-150"
+                                >
+                                    Remove Gift
+                                </button>
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+
+            <button
+                onClick={addGift}
+                className="mt-6 w-full py-2 px-4 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150"
+            >
+                Add New Gift
+            </button>
+            
+            <GiftSummaryTable gifts={gifts} />
+
+        </div>
+    );
+
+    if (isLoading || !userId) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-50 p-4">
+                <div className="text-center font-serif">
+                    <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+                    <p className="mt-4 text-gray-600">Securing data and loading LegacyCalc...</p>
+                </div>
+            </div>
+        );
+    }
+
+    // Prepare calculation data for display
+    const calculationForDisplay = {
+        ...calculation,
+        projectedExemptAssetsSpouseCharity: planData.exemptAssetsSpouseCharity, // Pass through constant for chart
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-50 font-serif p-4 sm:p-8">
+            <header className="mb-8 text-center">
+                <h1 className="text-5xl font-extrabold text-gray-900 tracking-tight">
+                    <LegacyCalcLogo />
+                    <span className="text-indigo-700">#1 Inheritance Tax</span> Calculator and Planner
+                </h1>
+                <p className="mt-2 text-xl text-gray-600">Scenario Modeler</p>
+                <p className="mt-1 text-sm text-gray-400">User ID: <span className="font-mono bg-gray-200 p-0.5 rounded">{userId}</span></p>
+            </header>
+
+            <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-8">
+                {/* Column 1: Inputs - NOW HAS A DISTINCT COLORED BACKGROUND */}
+                <div className="lg:col-span-1 space-y-8 bg-sky-100 p-6 rounded-xl shadow-xl border border-sky-300">
+                    <h2 className="text-2xl font-bold text-gray-800 border-b pb-3">
+                        Step 1: Input Your Estate Data
+                    </h2>
+                    
+                    {/* Key Contacts and Branding */}
+                    <KeyContacts value={planData} onChange={handleInputChange} />
+                    
+                    {/* 1. ASSET BREAKDOWN (MOVED TO TOP PRIORITY) */}
+                    <EstateBreakdown value={planData} onChange={handleInputChange} />
+                    
+                    {/* 2. GIFTS TRACKER */}
+                    <GiftsTracker 
+                        gifts={planData.gifts}
+                        handleGiftChange={handleGiftChange}
+                        addGift={addGift}
+                        removeGift={removeGift}
+                    />
+                    
+                    {/* 3. CONTROL PANEL */}
+                    <ControlPanel value={planData} onChange={handleInputChange} />
+                    
+                    {/* 4. SCENARIO CONTROLS (MOVED TO BOTTOM) */}
+                    <ScenarioControls />
+                </div>
+
+                {/* Column 2: Output & Analysis - PURE WHITE BACKGROUND */}
+                <div className="lg:col-span-1 space-y-6">
+                    <ResultSummary 
+                        calc={calculationForDisplay} 
+                        planData={planData} 
+                        handleBRAllocationChange={handleBRAllocationChange} 
+                    />
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default App;
